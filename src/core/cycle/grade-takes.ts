@@ -36,8 +36,9 @@
 
 import { createHash } from 'node:crypto';
 import { BaseCyclePhase, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
-import { chat as gatewayChat } from '../ai/gateway.ts';
-import { resolveModel } from '../model-config.ts';
+import { chat as gatewayChat, getChatModel } from '../ai/gateway.ts';
+import { splitProviderModelId } from '../model-id.ts';
+import { resolveModel } from '../../core/model-config.ts';
 import { GBrainError } from '../types.ts';
 import type { OperationContext } from '../operations.ts';
 import type { BrainEngine, Take, TakeResolution } from '../engine.ts';
@@ -220,7 +221,7 @@ export interface GradeTakesOpts extends BasePhaseOpts {
   /**
    * E2 ensemble judges. When useEnsemble=true and the single-model verdict
    * is borderline, all three judges are called in parallel via Promise.allSettled.
-   * Defaults to [openai:gpt-4o, anthropic:claude-sonnet-4-6, google:gemini-1.5-pro]
+   * Defaults to [openai:gpt-5.2, anthropic:claude-sonnet-4-6, google:gemini-2.0-flash]
    * via defaultJudge with model-string overrides. Tests inject deterministic
    * judges.
    */
@@ -396,15 +397,22 @@ class GradeTakesPhase extends BaseCyclePhase {
     const autoResolve = opts.autoResolve ?? false; // D17 default OFF
     const autoResolveThreshold = opts.autoResolveThreshold ?? 0.95; // D12 conservative
     const resolvedByLabel = opts.resolvedByLabel ?? 'gbrain:grade_takes';
-    // Resolve model via the gateway tier resolver so non-Anthropic stacks
-    // (ollama, openrouter, litellm, openai-compat) work without
-    // ANTHROPIC_API_KEY. Falls through opts.model → config key →
-    // models.tier.reasoning → TIER_DEFAULTS.reasoning.
-    const judgeModelId = opts.model ?? await resolveModel(engine, {
+    // One resolved string drives the judge call, the verdict-cache key, and
+    // the stored judge_model_id — the convention propose_takes adopted in
+    // v0.42.62. Previously the default judge call passed NO model hint (it
+    // rode the gateway's chat_model) while 'claude-sonnet-4-6' was hardcoded
+    // into judge_model_id, the evidence signature, and budget metering — on
+    // brains with a different chat_model, telemetry priced and recorded a
+    // model that never ran.
+    // Resolve via the gateway tier resolver so non-Anthropic stacks work.
+    const judgeModelFull = opts.model ?? await resolveModel(engine, {
       configKey: 'models.dream.grade_takes',
       tier: 'reasoning',
       fallback: 'claude-sonnet-4-6',
     });
+    // Bare tail for the stored judge_model_id + evidence signature
+    // (historical convention).
+    const judgeModelId = splitProviderModelId(judgeModelFull).model || judgeModelFull;
 
     const useEnsemble = opts.useEnsemble ?? false;
     const ensembleThreshold = opts.ensembleThreshold ?? 0.85;
@@ -477,7 +485,7 @@ class GradeTakesPhase extends BaseCyclePhase {
       // Call the single-model judge. Errors on a single take log warning + continue.
       let verdict: JudgeVerdict;
       try {
-        verdict = await judge({ take, evidence, modelHint: judgeModelId });
+        verdict = await judge({ take, evidence, modelHint: judgeModelFull });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         result.warnings.push(`judge failed on take ${take.id}: ${msg}`);

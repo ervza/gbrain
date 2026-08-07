@@ -26,8 +26,9 @@
  */
 
 import { BaseCyclePhase, type ScopedReadOpts, type BasePhaseOpts } from './base-phase.ts';
-import { chat as gatewayChat } from '../ai/gateway.ts';
-import { resolveModel } from '../model-config.ts';
+import { resolveOwnerHolder } from '../owner-holder.ts';
+import { chat as gatewayChat, getChatModel } from '../ai/gateway.ts';
+import { resolveModel } from '../../core/model-config.ts';
 import { gateVoice, type VoiceGateGenerator, type VoiceGateJudge } from '../calibration/voice-gate.ts';
 import { patternStatementTemplate, type PatternStatementSlots } from '../calibration/templates.ts';
 // v0.41 T10 — domain widening. The aggregator module resolves the active
@@ -90,13 +91,15 @@ export type PatternStatementsGenerator = (input: {
   holder: string;
   attempt: number;
   feedback?: string;
+  /** Provider-prefixed model the phase resolved; drives the generator's chat call. */
+  modelHint?: string;
 }) => Promise<string[]>;
 
 /** Generator function for bias tags (test seam). */
 export type BiasTagsGenerator = (patterns: string[]) => Promise<string[]>;
 
 export interface CalibrationProfileOpts extends BasePhaseOpts {
-  /** Holder to generate the profile for. Default 'garry'. */
+  /** Holder to generate the profile for. Default resolves via resolveOwnerHolder (config emotional_weight.user_holder, else 'self'). */
   holder?: string;
   /** Inject the patterns generator (tests). */
   patternsGenerator?: PatternStatementsGenerator;
@@ -227,12 +230,22 @@ class CalibrationProfilePhase extends BaseCyclePhase {
     _ctx: OperationContext,
     opts: CalibrationProfileOpts,
   ): Promise<{ summary: string; details: Record<string, unknown>; status?: PhaseStatus }> {
-    const holder = opts.holder ?? 'garry';
+    const holder = resolveOwnerHolder({
+      override: opts.holder,
+      configValue: await engine.getConfig('emotional_weight.user_holder'),
+    });
     const promptVersion = opts.promptVersion ?? CALIBRATION_PROFILE_PROMPT_VERSION;
     // Resolve model via the gateway tier resolver so non-Anthropic stacks
     // (ollama, openrouter, litellm, openai-compat) work without
     // ANTHROPIC_API_KEY. Falls through opts.model → config key →
     // models.tier.reasoning → TIER_DEFAULTS.reasoning.
+    // Follow the gateway's configured chat model, matching propose_takes
+    // (v0.42.62) and grade_takes: previously the generator stayed pinned to
+    // the TIER_DEFAULTS.reasoning constant, ignoring a configured
+    // chat_model. getChatModel() is provider-prefixed, preserving the #2451
+    // contract (a bare id fed back into gateway.chat() throws), and its
+    // default IS 'anthropic:claude-sonnet-4-6' — identical to the old
+    // constant — so stock installs are unchanged.
     const modelId = opts.model ?? await resolveModel(engine, {
       configKey: 'models.dream.calibration_profile',
       tier: 'reasoning',
@@ -273,6 +286,9 @@ class CalibrationProfilePhase extends BaseCyclePhase {
         scorecard,
         holder,
         attempt,
+        // The same resolved string that is persisted to model_id drives the
+        // generator's chat call — the phase can't record a model it didn't run.
+        modelHint: modelId,
         ...(feedback !== undefined ? { feedback } : {}),
       });
       return lines.join('\n');
